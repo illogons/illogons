@@ -1,0 +1,560 @@
+
+const API = "https://api.github.com";
+
+const owner = process.env.GITHUB_OWNER || "illogons";
+const token = process.env.GITHUB_TOKEN;
+
+if (!token) {
+  throw new Error("Falta GITHUB_TOKEN");
+}
+
+const headers = {
+  Accept: "application/vnd.github+json",
+  Authorization: `Bearer ${token}`,
+  "X-GitHub-Api-Version": "2022-11-28",
+};
+
+async function github(path) {
+  const response = await fetch(`${API}${path}`, { headers });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GitHub API ${response.status}: ${body}`);
+  }
+
+  return response.json();
+}
+
+/* ─────────────────────────────────────────────
+   REPOSITORIOS
+   ───────────────────────────────────────────── */
+
+async function getAllRepos() {
+  const repos = [];
+
+  for (let page = 1; page <= 10; page++) {
+    const data = await github(
+      `/users/${owner}/repos?per_page=100&page=${page}&type=owner&sort=pushed`
+    );
+
+    repos.push(...data);
+
+    if (data.length < 100) {
+      break;
+    }
+  }
+
+  return repos.filter(
+    (repo) =>
+      !repo.fork &&
+      !repo.archived &&
+      !repo.private
+  );
+}
+
+/* ─────────────────────────────────────────────
+   ICONOS DE LENGUAJES
+   ───────────────────────────────────────────── */
+
+const languageIconMap = {
+  JavaScript: "js",
+  TypeScript: "ts",
+  HTML: "html",
+  CSS: "css",
+  Java: "java",
+  PHP: "php",
+  Python: "python",
+  C: "c",
+  "C++": "cpp",
+  "C#": "cs",
+  Kotlin: "kotlin",
+  Swift: "swift",
+  Go: "go",
+  Rust: "rust",
+  Ruby: "ruby",
+  Dart: "dart",
+  Shell: "bash",
+  SQL: "mysql",
+};
+
+/* ─────────────────────────────────────────────
+   ICONOS DE HERRAMIENTAS
+   ───────────────────────────────────────────── */
+
+const toolIconMap = {
+  "IntelliJ IDEA": "idea",
+  Eclipse: "eclipse",
+  "VS Code": "vscode",
+  Git: "git",
+  GitHub: "github",
+  Docker: "docker",
+  "GitHub Actions": "githubactions",
+  MySQL: "mysql",
+  PostgreSQL: "postgresql",
+  SQLite: "sqlite",
+  Maven: "maven",
+  Gradle: "gradle",
+  "Node.js": "nodejs",
+  Spring: "spring",
+  JavaFX: "java",
+  Bootstrap: "bootstrap",
+};
+
+/* ─────────────────────────────────────────────
+   LENGUAJES
+   ───────────────────────────────────────────── */
+
+async function getLanguages(repo) {
+  return github(`/repos/${owner}/${repo.name}/languages`);
+}
+
+/*
+ * Solo mostramos un lenguaje si representa
+ * al menos el 5% del código total detectado.
+ *
+ * Esto evita que aparezcan lenguajes residuales
+ * utilizados en cantidades muy pequeñas.
+ */
+
+async function buildStack(repos) {
+  const languageTotals = {};
+
+  for (const repo of repos) {
+    try {
+      const languages = await getLanguages(repo);
+
+      for (const [language, bytes] of Object.entries(languages)) {
+        languageTotals[language] =
+          (languageTotals[language] || 0) + bytes;
+      }
+    } catch {
+      console.log(
+        `No se pudieron leer los lenguajes de ${repo.name}`
+      );
+    }
+  }
+
+  const totalBytes = Object.values(languageTotals).reduce(
+    (total, bytes) => total + bytes,
+    0
+  );
+
+  if (totalBytes === 0) {
+    return `<p align="center">No hay lenguajes detectados todavía.</p>`;
+  }
+
+  const MIN_PERCENTAGE = 5;
+
+  const languages = Object.entries(languageTotals)
+    .map(([language, bytes]) => ({
+      language,
+      bytes,
+      percentage: (bytes / totalBytes) * 100,
+    }))
+    .filter(
+      (item) =>
+        item.percentage >= MIN_PERCENTAGE &&
+        languageIconMap[item.language]
+    )
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 10);
+
+  if (languages.length === 0) {
+    return `<p align="center">Todavía no hay suficientes lenguajes relevantes.</p>`;
+  }
+
+  console.log("\nLenguajes detectados:");
+
+  for (const item of languages) {
+    console.log(
+      `${item.language}: ${item.percentage.toFixed(2)}%`
+    );
+  }
+
+  const icons = languages
+    .map((item) => languageIconMap[item.language])
+    .join(",");
+
+  return `<p align="center">
+<img src="https://skillicons.dev/icons?i=${icons}&perline=8" alt="Tecnologías detectadas"/>
+</p>`;
+}
+
+/* ─────────────────────────────────────────────
+   ÁRBOL DE REPOSITORIO
+   ───────────────────────────────────────────── */
+
+async function getRepoTree(repo) {
+  try {
+    return await github(
+      `/repos/${owner}/${repo.name}/git/trees/${repo.default_branch}?recursive=1`
+    );
+  } catch {
+    return { tree: [] };
+  }
+}
+
+function hasFile(tree, names) {
+  return tree.some((item) => {
+    if (item.type !== "blob" && item.type !== "tree") {
+      return false;
+    }
+
+    const path = item.path.toLowerCase();
+
+    return names.some((name) => {
+      const target = name.toLowerCase();
+
+      return (
+        path === target ||
+        path.includes(target)
+      );
+    });
+  });
+}
+
+function hasExtension(tree, extension) {
+  return tree.some(
+    (item) =>
+      item.type === "blob" &&
+      item.path.toLowerCase().endsWith(extension)
+  );
+}
+
+/* ─────────────────────────────────────────────
+   DETECCIÓN DEL ENTORNO
+   ───────────────────────────────────────────── */
+
+async function detectEnvironment(repos) {
+  const detected = new Set();
+
+  // Herramientas base
+  detected.add("Git");
+  detected.add("GitHub");
+
+  // Revisamos como máximo 20 repositorios
+  const reposToInspect = repos.slice(0, 20);
+
+  for (const repo of reposToInspect) {
+    const result = await getRepoTree(repo);
+    const tree = result.tree || [];
+
+    /* IntelliJ IDEA */
+
+    if (
+      hasFile(tree, [".idea"]) ||
+      hasExtension(tree, ".iml")
+    ) {
+      detected.add("IntelliJ IDEA");
+    }
+
+    /* VS Code */
+
+    if (hasFile(tree, [".vscode"])) {
+      detected.add("VS Code");
+    }
+
+    /* Eclipse */
+
+    if (
+      hasFile(tree, [".project"]) ||
+      hasFile(tree, [".classpath"]) ||
+      hasFile(tree, [".settings"])
+    ) {
+      detected.add("Eclipse");
+    }
+
+    /* Docker */
+
+    if (
+      hasFile(tree, ["dockerfile"]) ||
+      hasFile(tree, ["docker-compose.yml"]) ||
+      hasFile(tree, ["compose.yml"])
+    ) {
+      detected.add("Docker");
+    }
+
+    /* Maven */
+
+    if (hasFile(tree, ["pom.xml"])) {
+      detected.add("Maven");
+    }
+
+    /* Gradle */
+
+    if (
+      hasFile(tree, ["build.gradle"]) ||
+      hasFile(tree, ["settings.gradle"]) ||
+      hasFile(tree, ["build.gradle.kts"])
+    ) {
+      detected.add("Gradle");
+    }
+
+    /* Node.js */
+
+    if (
+      hasFile(tree, ["package.json"]) ||
+      hasFile(tree, ["package-lock.json"]) ||
+      hasFile(tree, ["yarn.lock"]) ||
+      hasFile(tree, ["pnpm-lock.yaml"])
+    ) {
+      detected.add("Node.js");
+    }
+
+    /* GitHub Actions */
+
+    if (hasFile(tree, [".github/workflows"])) {
+      detected.add("GitHub Actions");
+    }
+
+    /* JavaFX */
+
+    if (hasExtension(tree, ".fxml")) {
+      detected.add("JavaFX");
+    }
+
+    /*
+     * Spring
+     *
+     * Se considera Spring si encontramos
+     * archivos o configuraciones típicas.
+     */
+
+    if (
+      hasFile(tree, ["spring-boot"]) ||
+      hasFile(tree, ["springframework"]) ||
+      hasFile(tree, ["application.properties"]) ||
+      hasFile(tree, ["application.yml"]) ||
+      hasFile(tree, ["application.yaml"])
+    ) {
+      detected.add("Spring");
+    }
+
+    /*
+     * MySQL
+     *
+     * Buscamos señales típicas de MySQL.
+     */
+
+    if (
+      hasFile(tree, ["mysql"]) ||
+      hasFile(tree, ["mysqld"]) ||
+      hasFile(tree, ["mysql-connector"]) ||
+      hasFile(tree, ["mysql-connector-j"])
+    ) {
+      detected.add("MySQL");
+    }
+
+    /*
+     * SQLite
+     */
+
+    if (
+      hasFile(tree, ["sqlite"]) ||
+      hasFile(tree, [".db"]) ||
+      hasFile(tree, [".sqlite"]) ||
+      hasFile(tree, [".sqlite3"])
+    ) {
+      detected.add("SQLite");
+    }
+
+    /*
+     * PostgreSQL
+     */
+
+    if (
+      hasFile(tree, ["postgres"]) ||
+      hasFile(tree, ["postgresql"])
+    ) {
+      detected.add("PostgreSQL");
+    }
+
+    /*
+     * Bootstrap
+     */
+
+    if (
+      hasFile(tree, ["bootstrap"]) ||
+      hasFile(tree, ["bootstrap.min.css"])
+    ) {
+      detected.add("Bootstrap");
+    }
+  }
+
+  /*
+   * Orden en el que aparecerán las herramientas
+   * en el README.
+   */
+
+  const ordered = [
+    "Git",
+    "GitHub",
+    "IntelliJ IDEA",
+    "Eclipse",
+    "VS Code",
+    "Docker",
+    "Maven",
+    "Gradle",
+    "Node.js",
+    "JavaFX",
+    "Spring",
+    "MySQL",
+    "PostgreSQL",
+    "SQLite",
+    "Bootstrap",
+    "GitHub Actions",
+  ];
+
+  return ordered.filter((tool) =>
+    detected.has(tool)
+  );
+}
+
+/* ─────────────────────────────────────────────
+   ICONOS DEL ENTORNO
+   ───────────────────────────────────────────── */
+
+function buildToolIcons(tools) {
+  const icons = tools
+    .map((tool) => toolIconMap[tool])
+    .filter(Boolean);
+
+  if (icons.length === 0) {
+    return `<p align="center">
+Herramientas detectadas automáticamente.
+</p>`;
+  }
+
+  return `<p align="center">
+<img src="https://skillicons.dev/icons?i=${icons.join(",")}&perline=8" alt="Entorno de desarrollo"/>
+</p>`;
+}
+
+/* ─────────────────────────────────────────────
+   REEMPLAZAR BLOQUES AUTOMÁTICOS
+   ───────────────────────────────────────────── */
+
+function replaceSection(
+  content,
+  startMarker,
+  endMarker,
+  replacement
+) {
+  const start =
+    content.indexOf(startMarker);
+
+  const end =
+    content.indexOf(endMarker);
+
+  if (
+    start === -1 ||
+    end === -1 ||
+    end < start
+  ) {
+    throw new Error(
+      `No se encontraron los marcadores:
+${startMarker}
+${endMarker}`
+    );
+  }
+
+  const startContent =
+    start + startMarker.length;
+
+  return (
+    content.slice(0, startContent) +
+    "\n" +
+    replacement +
+    "\n" +
+    content.slice(end)
+  );
+}
+
+/* ─────────────────────────────────────────────
+   MAIN
+   ───────────────────────────────────────────── */
+
+async function main() {
+  const fs =
+    await import("node:fs/promises");
+
+  console.log(
+    `Analizando GitHub de ${owner}...`
+  );
+
+  const repos =
+    await getAllRepos();
+
+  console.log(
+    `Repositorios encontrados: ${repos.length}`
+  );
+
+  /* Stack */
+
+  console.log(
+    "Analizando lenguajes..."
+  );
+
+  const stack =
+    await buildStack(repos);
+
+  /* Entorno */
+
+  console.log(
+    "Analizando entorno..."
+  );
+
+  const tools =
+    await detectEnvironment(repos);
+
+  const environment =
+    buildToolIcons(tools);
+
+  /* README */
+
+  let readme =
+    await fs.readFile(
+      "README.md",
+      "utf8"
+    );
+
+  readme =
+    replaceSection(
+      readme,
+      "<!-- AUTO-STACK:START -->",
+      "<!-- AUTO-STACK:END -->",
+      stack
+    );
+
+  readme =
+    replaceSection(
+      readme,
+      "<!-- AUTO-ENV:START -->",
+      "<!-- AUTO-ENV:END -->",
+      environment
+    );
+
+  await fs.writeFile(
+    "README.md",
+    readme
+  );
+
+  console.log(
+    "\n✅ README actualizado correctamente."
+  );
+
+  console.log(
+    "🛠️ Entorno:",
+    tools.join(", ")
+  );
+}
+
+main().catch((error) => {
+  console.error(
+    "❌ Error:",
+    error
+  );
+
+  process.exit(1);
+});
+
